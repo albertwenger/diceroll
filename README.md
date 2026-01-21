@@ -5,7 +5,7 @@ Get a robot arm to pick up and roll dice
 
 1. Install dependencies:
    ```
-   pip install viam-sdk
+   pip install viam-sdk numpy
    ```
 
 2. Copy the credentials template and fill in your values:
@@ -18,6 +18,16 @@ Get a robot arm to pick up and roll dice
    ```
    python robot.py
    ```
+
+## Calibration
+
+To calibrate the camera-to-arm transform (required for accurate pick-and-place):
+
+```
+python calibrate.py
+```
+
+This moves the arm through multiple poses, detects the gripper position in the RealSense depth data, and computes the rigid transform. Results are saved to `calibration_results.json` and printed as VIAM frame configuration.
 
 ## Hardware
 
