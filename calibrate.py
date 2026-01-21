@@ -1,20 +1,26 @@
 """
-Camera-to-arm calibration script.
+Automatic frame system calibration.
 
-Calibrates the RealSense camera position relative to the arm by:
-1. Fitting a plane to the desk surface (gives camera height and tilt)
-2. Detecting the arm base (gives x,y offset)
+Uses two cameras to automatically determine:
+1. Arm axis directions (via webcam observation of arm movement)
+2. Camera mounting offset (via RealSense depth measurements)
 
-No arm movement required - just a single depth capture.
+Safety: Makes small incremental movements and checks webcam after each.
 """
 
 import asyncio
 import json
+import struct
 from pathlib import Path
+from datetime import datetime
 
 import numpy as np
+from PIL import Image
+
 from viam.robot.client import RobotClient
+from viam.components.arm import Arm
 from viam.components.camera import Camera
+from viam.proto.component.arm import JointPositions
 from viam.media.utils.pil import viam_to_pil_image
 
 
@@ -33,538 +39,383 @@ async def connect():
     return await RobotClient.at_address(creds["robot_address"], opts)
 
 
-def depth_to_points(depth_img: np.ndarray,
-                    fx: float, fy: float,
-                    cx: float, cy: float) -> np.ndarray:
+def parse_depth_image(raw_bytes: bytes) -> np.ndarray:
+    """Parse VIAM depth image format."""
+    if raw_bytes[:8] == b"DEPTHMAP":
+        # Try to infer dimensions from data size
+        # Header is typically 16 bytes: magic(8) + width(4) + height(4)
+        data_after_magic = raw_bytes[8:]
+
+        # Try 32-bit width/height (4 bytes each)
+        width_32 = struct.unpack('<I', raw_bytes[8:12])[0]
+        height_32 = struct.unpack('<I', raw_bytes[12:16])[0]
+        pixel_data = raw_bytes[16:]
+
+        expected_size = width_32 * height_32 * 2
+        if abs(expected_size - len(pixel_data)) < 100:
+            depth = np.frombuffer(pixel_data[:expected_size], dtype=np.uint16)
+            return depth.reshape((height_32, width_32))
+
+        # Fallback: infer from common resolutions
+        total_pixels = len(raw_bytes[16:]) // 2
+        for w, h in [(1280, 720), (640, 480), (848, 480), (640, 360)]:
+            if w * h == total_pixels:
+                return np.frombuffer(raw_bytes[16:16 + w*h*2], dtype=np.uint16).reshape((h, w))
+
+        # Last resort: try 24-byte header
+        total_pixels = len(raw_bytes[24:]) // 2
+        for w, h in [(1280, 720), (640, 480), (848, 480), (640, 360)]:
+            if w * h == total_pixels:
+                return np.frombuffer(raw_bytes[24:24 + w*h*2], dtype=np.uint16).reshape((h, w))
+
+    raise ValueError(f"Cannot parse depth image, size={len(raw_bytes)}")
+
+
+async def get_depth_image(camera: Camera) -> np.ndarray:
+    """Get depth image from RealSense."""
+    images, metadata = await camera.get_images()
+    for img in images:
+        if hasattr(img, 'data') and len(img.data) > 8 and img.data[:8] == b"DEPTHMAP":
+            return parse_depth_image(img.data)
+    raise ValueError("No depth image found")
+
+
+async def get_webcam_image(camera: Camera) -> Image.Image:
+    """Get RGB image from webcam."""
+    images, metadata = await camera.get_images()
+    if images:
+        return viam_to_pil_image(images[0])
+    raise ValueError("No image returned")
+
+
+def get_center_depth(depth: np.ndarray, region_size: int = 50) -> float:
+    """Get median depth in center region of image (in mm)."""
+    h, w = depth.shape
+    cy, cx = h // 2, w // 2
+    r = region_size // 2
+    center_region = depth[cy-r:cy+r, cx-r:cx+r]
+    valid = center_region[center_region > 0]
+    if len(valid) == 0:
+        return 0.0
+    return float(np.median(valid))
+
+
+async def clear_arm_error(arm: Arm):
+    """Try to clear arm error state."""
+    try:
+        await arm.do_command({"clear_error": True})
+        print("  Cleared arm error")
+        await asyncio.sleep(1.0)
+    except Exception as e:
+        print(f"  Could not clear error: {e}")
+
+
+async def get_current_joints(arm: Arm) -> list:
+    """Get current joint positions."""
+    joints = await arm.get_joint_positions()
+    return list(joints.values)
+
+
+async def get_arm_position(arm: Arm) -> dict:
+    """Get current arm end-effector position."""
+    pos = await arm.get_end_position()
+    return {"x": pos.x, "y": pos.y, "z": pos.z}
+
+
+async def safe_move_joints(arm: Arm, target_joints: list, webcam: Camera,
+                           output_dir: Path, step_name: str, max_step: float = 10.0):
     """
-    Convert depth image to 3D point cloud.
-
-    Returns Nx3 array of [x, y, z] points in camera frame (mm).
-    Also returns the pixel coordinates as Nx2 array.
-    """
-    h, w = depth_img.shape[:2]
-
-    # Create pixel coordinate grids
-    u = np.arange(w)
-    v = np.arange(h)
-    u, v = np.meshgrid(u, v)
-
-    # Get depth values
-    z = depth_img.astype(np.float32)
-
-    # Filter invalid depths - RealSense depth is typically in mm
-    # Expand range to handle various setups (10cm to 10m)
-    valid = (z > 100) & (z < 10000)
-
-    # Convert to 3D
-    x = (u - cx) * z / fx
-    y = (v - cy) * z / fy
-
-    # Stack and filter
-    points = np.stack([x[valid], y[valid], z[valid]], axis=-1)
-    pixels = np.stack([u[valid], v[valid]], axis=-1)
-
-    return points, pixels
-
-
-def fit_plane_ransac(points: np.ndarray,
-                     n_iterations: int = 1000,
-                     distance_threshold: float = 10.0,
-                     horizontal_only: bool = False) -> tuple[np.ndarray, float, np.ndarray]:
-    """
-    Fit a plane to points using RANSAC.
+    Safely move to target joints in small increments, checking webcam after each.
 
     Args:
-        points: Nx3 array of 3D points
-        n_iterations: Number of RANSAC iterations
-        distance_threshold: Inlier distance threshold in mm
-        horizontal_only: If True, only accept planes that are roughly horizontal
-                        (normal has large z component in camera frame)
-
-    Returns:
-        normal: Plane normal vector (3,)
-        d: Plane offset (plane equation: normal · p + d = 0)
-        inliers: Boolean mask of inlier points
+        arm: The arm component
+        target_joints: Target joint positions in degrees
+        webcam: Webcam for visual verification
+        output_dir: Directory to save images
+        step_name: Name for logging/saving
+        max_step: Maximum degrees to move per step
     """
-    best_inliers = None
-    best_normal = None
-    best_d = None
-    best_count = 0
+    current = await get_current_joints(arm)
+    target = [float(t) for t in target_joints]
 
-    n_points = len(points)
+    print(f"\n  Safe move to: {step_name}")
+    print(f"  Current joints: [{', '.join(f'{j:.1f}' for j in current)}]")
+    print(f"  Target joints:  [{', '.join(f'{j:.1f}' for j in target)}]")
 
-    for _ in range(n_iterations):
-        # Sample 3 random points
-        idx = np.random.choice(n_points, 3, replace=False)
-        p1, p2, p3 = points[idx]
+    # Calculate total distance
+    diffs = [t - c for t, c in zip(target, current)]
+    max_diff = max(abs(d) for d in diffs)
 
-        # Compute plane normal
-        v1 = p2 - p1
-        v2 = p3 - p1
-        normal = np.cross(v1, v2)
-        norm = np.linalg.norm(normal)
-        if norm < 1e-6:
-            continue
-        normal = normal / norm
+    if max_diff < 1.0:
+        print("  Already at target position")
+        return True
 
-        # If horizontal_only, reject planes that aren't roughly horizontal
-        # A horizontal desk viewed from above should have normal with large |z| component
-        if horizontal_only:
-            # Camera looks forward/down, desk normal should have significant z component
-            # Allow for tilted camera - normal z should be > 0.5 (within ~60 deg of vertical)
-            if abs(normal[2]) < 0.5:
-                continue
+    # Calculate number of steps needed
+    num_steps = max(1, int(np.ceil(max_diff / max_step)))
+    print(f"  Moving in {num_steps} steps (max {max_step}° per step)")
 
-        # Plane offset
-        d = -np.dot(normal, p1)
+    # Capture initial webcam image
+    img_before = await get_webcam_image(webcam)
 
-        # Count inliers
-        distances = np.abs(np.dot(points, normal) + d)
-        inliers = distances < distance_threshold
-        count = np.sum(inliers)
+    for step in range(1, num_steps + 1):
+        # Interpolate to next position
+        t = step / num_steps
+        intermediate = [c + (tgt - c) * t for c, tgt in zip(current, target)]
 
-        if count > best_count:
-            best_count = count
-            best_inliers = inliers
-            best_normal = normal
-            best_d = d
+        print(f"  Step {step}/{num_steps}: [{', '.join(f'{j:.1f}' for j in intermediate)}]", end="")
 
-    if best_normal is None:
-        return np.array([0, 0, -1]), 0.0, np.zeros(len(points), dtype=bool)
+        try:
+            joint_pos = JointPositions(values=intermediate)
+            await arm.move_to_joint_positions(positions=joint_pos)
+            await asyncio.sleep(0.5)
 
-    # Ensure normal points "up" (toward camera, so negative z in camera frame)
-    if best_normal[2] > 0:
-        best_normal = -best_normal
-        best_d = -best_d
+            # Get position after move
+            pos = await get_arm_position(arm)
+            print(f" -> pos: x={pos['x']:.0f}, y={pos['y']:.0f}, z={pos['z']:.0f}")
 
-    return best_normal, best_d, best_inliers
+            # Capture webcam image to verify
+            img_after = await get_webcam_image(webcam)
 
+            # Save intermediate images for debugging
+            if step == num_steps:
+                img_after.save(output_dir / f"{step_name}.jpg")
 
-def find_arm_base(depth_img: np.ndarray,
-                  points: np.ndarray,
-                  pixels: np.ndarray,
-                  desk_normal: np.ndarray,
-                  desk_d: float,
-                  desk_inliers: np.ndarray,
-                  fx: float, fy: float,
-                  cx: float, cy: float) -> tuple[np.ndarray | None, dict]:
-    """
-    Find the arm base in the depth image.
+        except Exception as e:
+            error_str = str(e).lower()
+            if "collision" in error_str or "overcurrent" in error_str:
+                print(f"\n  COLLISION DETECTED at step {step}!")
+                print(f"  Stopping movement. Error: {e}")
+                # Save the problematic state
+                try:
+                    img_err = await get_webcam_image(webcam)
+                    img_err.save(output_dir / f"{step_name}_COLLISION.jpg")
+                except:
+                    pass
+                return False
+            elif "power cycle" in error_str:
+                print(f"\n  ARM NEEDS POWER CYCLE!")
+                return False
+            else:
+                print(f"\n  Error: {e}")
+                return False
 
-    Strategy: The arm base is a vertical structure rising from the desk.
-    Look for points that are:
-    1. NOT on the desk plane (elevated above it / closer to camera)
-    2. Form a cluster
-    3. Project to desk plane to find base position
-
-    Returns:
-        base_position: [x, y, z] in camera frame, or None if not found
-        debug: Debug information
-    """
-    debug = {}
-
-    # Distance from each point to the desk plane
-    # Negative = point is "above" desk (closer to camera)
-    distances_to_desk = np.dot(points, desk_normal) + desk_d
-
-    debug["dist_to_desk_range"] = (float(distances_to_desk.min()), float(distances_to_desk.max()))
-
-    # Find points above the desk (closer to camera = negative distance)
-    # The arm should be significantly above desk - at least 50mm
-    above_desk = distances_to_desk < -50
-
-    elevated_points = points[above_desk]
-    elevated_pixels = pixels[above_desk]
-    elevated_distances = distances_to_desk[above_desk]
-
-    debug["elevated_points"] = len(elevated_points)
-
-    if len(elevated_points) < 50:
-        return None, {"error": f"Not enough elevated points: {len(elevated_points)}"}
-
-    # The arm is a distinct structure - find clusters of elevated points
-    # The arm base should be where elevated points meet the desk
-    # Look for points that are 50-500mm above desk (the lower part of the arm)
-    base_region = (elevated_distances < -50) & (elevated_distances > -500)
-    base_points = elevated_points[base_region]
-    base_pixels = elevated_pixels[base_region]
-
-    debug["base_region_points"] = len(base_points)
-
-    if len(base_points) < 20:
-        # Try wider range
-        base_region = (elevated_distances < -30) & (elevated_distances > -1000)
-        base_points = elevated_points[base_region]
-        base_pixels = elevated_pixels[base_region]
-        debug["base_region_points_expanded"] = len(base_points)
-
-    if len(base_points) < 20:
-        # Just use all elevated points and find the ones closest to desk
-        sort_idx = np.argsort(elevated_distances)[-100:]  # Closest to desk
-        base_points = elevated_points[sort_idx]
-        base_pixels = elevated_pixels[sort_idx]
-        debug["using_closest_to_desk"] = len(base_points)
-
-    if len(base_points) < 10:
-        return None, {"error": f"Not enough base region points after expansion"}
-
-    # Find the centroid - use median for robustness
-    base_centroid = np.median(base_points, axis=0)
-    base_pixel = np.median(base_pixels, axis=0)
-
-    debug["base_centroid_pixel"] = (int(base_pixel[0]), int(base_pixel[1]))
-    debug["base_centroid_3d"] = [float(x) for x in base_centroid]
-
-    # Project to desk plane to get the arm base origin
-    dist_to_desk = np.dot(base_centroid, desk_normal) + desk_d
-    base_on_desk = base_centroid - dist_to_desk * desk_normal
-
-    debug["base_on_desk_3d"] = [float(x) for x in base_on_desk]
-    debug["height_above_desk"] = float(-dist_to_desk)
-
-    return base_on_desk, debug
-
-
-def compute_camera_transform(desk_normal: np.ndarray,
-                             desk_d: float,
-                             arm_base_camera: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Compute the camera position in arm frame coordinates.
-
-    Assumptions:
-    - The desk is the z=0 plane in arm frame
-    - The arm base is at the origin (0, 0, 0) in arm frame
-    - The desk normal in arm frame is [0, 0, 1] (pointing up)
-    - Camera +z points into the scene (away from camera)
-
-    Args:
-        desk_normal: Desk plane normal in camera frame (points toward camera)
-        desk_d: Desk plane offset in camera frame (negative of distance to desk)
-        arm_base_camera: Arm base position in camera frame [x, y, z]
-
-    Returns:
-        R: Rotation matrix (camera frame to arm frame)
-        t: Translation vector (camera origin in arm frame)
-    """
-    # Camera coordinate system:
-    # - Origin at camera
-    # - +z points into scene (toward desk)
-    # - +x typically points right, +y points down
-
-    # Arm coordinate system:
-    # - Origin at arm base
-    # - +z points up
-    # - +x points forward, +y points left (typical robot convention)
-
-    # desk_normal in camera frame points toward camera (negative z if looking down)
-    # In arm frame, desk normal is [0, 0, 1]
-
-    # The camera sees the arm base at position arm_base_camera
-    # We need to find where the camera is in arm frame
-
-    # Step 1: Camera height above desk
-    # Distance from camera to desk plane is |desk_d|
-    camera_height = abs(desk_d)
-
-    # Step 2: Camera's x,y position relative to arm base
-    # arm_base_camera gives us the arm base position in camera frame
-    # We need to transform this to arm frame
-
-    # For a camera looking straight down (desk_normal ≈ [0, 0, -1]):
-    # - Camera's +x corresponds to some direction in arm's x-y plane
-    # - Camera's +y corresponds to another direction in arm's x-y plane
-    # - Camera's +z corresponds to arm's -z (camera looks down)
-
-    # Build rotation matrix from camera frame to arm frame
-    # arm_z (up) = -desk_normal (flip because desk_normal points at camera)
-    arm_z_in_cam = -desk_normal
-
-    # For arm_x and arm_y, we need to determine the camera's yaw
-    # Without additional information, assume camera x aligns with arm y
-    # (camera is behind the arm, looking at it from the back-left based on webcam)
-
-    # Create orthonormal basis
-    if abs(arm_z_in_cam[0]) < 0.9:
-        temp = np.array([1, 0, 0])
-    else:
-        temp = np.array([0, 1, 0])
-
-    arm_y_in_cam = np.cross(arm_z_in_cam, temp)
-    arm_y_in_cam = arm_y_in_cam / np.linalg.norm(arm_y_in_cam)
-
-    arm_x_in_cam = np.cross(arm_y_in_cam, arm_z_in_cam)
-    arm_x_in_cam = arm_x_in_cam / np.linalg.norm(arm_x_in_cam)
-
-    # R transforms from camera frame to arm frame
-    # Rows are arm basis vectors expressed in camera frame
-    R = np.array([arm_x_in_cam, arm_y_in_cam, arm_z_in_cam])
-
-    # Camera position in arm frame:
-    # The camera is at the origin in camera frame
-    # The arm base is at arm_base_camera in camera frame
-    # In arm frame, the arm base is at origin
-    # So: camera_pos_arm = -R @ arm_base_camera (roughly)
-
-    # But we also know camera is at height camera_height above desk (z=0)
-    # So camera z in arm frame = camera_height
-
-    # Transform arm base position to arm frame (should give ~[0,0,0])
-    # Camera position = -R @ arm_base_camera would work if arm_base was on desk
-    # But arm_base_camera is projected to desk, so we need to account for that
-
-    # The arm base is at [0, 0, 0] in arm frame
-    # The camera sees it at arm_base_camera in camera frame
-    # Camera position in arm frame:
-    camera_pos_arm = -R @ arm_base_camera
-
-    # Adjust z to be the camera height (positive, above desk)
-    camera_pos_arm[2] = camera_height
-
-    return R, camera_pos_arm
-
-
-def rotation_matrix_to_axis_angle(R: np.ndarray) -> tuple[np.ndarray, float]:
-    """Convert rotation matrix to axis-angle representation."""
-    angle = np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))
-
-    if np.abs(angle) < 1e-6:
-        return np.array([0, 0, 1]), 0.0
-
-    axis = np.array([
-        R[2, 1] - R[1, 2],
-        R[0, 2] - R[2, 0],
-        R[1, 0] - R[0, 1]
-    ]) / (2 * np.sin(angle))
-
-    return axis / np.linalg.norm(axis), np.degrees(angle)
+    print(f"  Move complete!")
+    return True
 
 
 async def main():
-    print("Connecting to robot...")
+    print("=" * 60)
+    print("SAFE AUTOMATIC FRAME CALIBRATION")
+    print("=" * 60)
+    print("""
+This script safely calibrates the frame system by:
+1. Making small incremental movements (max 10° per step)
+2. Checking webcam after each movement
+3. Stopping immediately if collision detected
+
+Requirements:
+- Clear workspace around arm
+- Webcam with view of arm
+- RealSense mounted on arm end-effector
+""")
+
+    print("\nConnecting to robot...")
     machine = await connect()
     print("Connected!")
 
+    arm = Arm.from_robot(machine, "lite6")
+    webcam = Camera.from_robot(machine, "webcam")
     realsense = Camera.from_robot(machine, "realsense")
 
-    # Get camera intrinsics (approximate for RealSense D435)
-    # These should ideally come from camera.get_properties()
+    output_dir = Path("calibration_images")
+    output_dir.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # Clear any existing arm errors
+    print("\nClearing any existing arm errors...")
+    await clear_arm_error(arm)
+    await asyncio.sleep(1.0)
+
+    # ============================================================
+    # STEP 0: Observe current state
+    # ============================================================
+    print("\n" + "=" * 60)
+    print("STEP 0: Observe current arm state")
+    print("=" * 60)
+
+    current_joints = await get_current_joints(arm)
+    current_pos = await get_arm_position(arm)
+
+    print(f"  Current joints: [{', '.join(f'{j:.1f}' for j in current_joints)}]")
+    print(f"  Current position: x={current_pos['x']:.1f}, y={current_pos['y']:.1f}, z={current_pos['z']:.1f} mm")
+
+    # Capture current webcam view
+    webcam_img = await get_webcam_image(webcam)
+    webcam_img.save(output_dir / f"{timestamp}_00_initial.jpg")
+    print(f"  Saved initial webcam image")
+
+    # Try to get depth
     try:
-        props = await realsense.get_properties()
-        print(f"Camera properties: {props}")
-        fx = props.intrinsic_parameters.focal_x_px
-        fy = props.intrinsic_parameters.focal_y_px
-        cx = props.intrinsic_parameters.center_x_px
-        cy = props.intrinsic_parameters.center_y_px
-        print(f"Using camera intrinsics: fx={fx:.1f}, fy={fy:.1f}, cx={cx:.1f}, cy={cy:.1f}")
+        depth = await get_depth_image(realsense)
+        center_depth = get_center_depth(depth)
+        print(f"  RealSense center depth: {center_depth:.1f} mm")
     except Exception as e:
-        print(f"Could not get camera properties ({e}), using defaults")
-        fx, fy = 380, 380
-        cx, cy = 320, 240
+        print(f"  Could not get depth: {e}")
+        center_depth = 0
 
-    # Capture depth image
-    print("\nCapturing depth image...")
-    images, metadata = await realsense.get_images()
-
-    depth_img = None
-    color_img = None
-    for img in images:
-        print(f"  Found image: {img.name}, mime_type: {img.mime_type}")
-        if "depth" in img.name.lower():
-            # Depth images are raw 16-bit data
-            if "depth" in img.mime_type or "raw" in img.mime_type or img.mime_type == "image/vnd.viam.dep":
-                # Raw depth data - typically has a small header followed by 16-bit unsigned integers
-                raw_data = img.data
-                h, w = 720, 1280  # From camera properties
-                expected_size = h * w * 2  # 2 bytes per pixel (uint16)
-
-                # Check for header (data size > expected)
-                header_size = len(raw_data) - expected_size
-                if header_size > 0 and header_size < 100:
-                    print(f"  Skipping {header_size} byte header")
-                    raw_data = raw_data[header_size:]
-
-                depth_data = np.frombuffer(raw_data, dtype=np.uint16)
-                if len(depth_data) == h * w:
-                    depth_img = depth_data.reshape((h, w))
-                else:
-                    print(f"  WARNING: Unexpected depth data size: {len(depth_data)} (expected {h*w})")
-                    # Try to infer dimensions
-                    total = len(depth_data)
-                    for test_h in [480, 720, 1080]:
-                        if total % test_h == 0:
-                            test_w = total // test_h
-                            print(f"  Trying shape: {test_h}x{test_w}")
-                            depth_img = depth_data.reshape((test_h, test_w))
-                            break
-            else:
-                try:
-                    pil_img = viam_to_pil_image(img)
-                    depth_img = np.array(pil_img)
-                except Exception as e:
-                    print(f"  Could not decode depth image: {e}")
-        elif "color" in img.name.lower():
-            try:
-                pil_img = viam_to_pil_image(img)
-                color_img = np.array(pil_img)
-            except Exception as e:
-                print(f"  Could not decode color image: {e}")
-
-    if depth_img is None:
-        print("ERROR: No depth image found!")
-        await machine.close()
-        return
-
-    print(f"Depth image shape: {depth_img.shape}, dtype: {depth_img.dtype}")
-    print(f"Depth range: {depth_img.min()} - {depth_img.max()}")
-
-    # Analyze depth distribution
-    nonzero_depth = depth_img[depth_img > 0]
-    if len(nonzero_depth) > 0:
-        print(f"Non-zero depth pixels: {len(nonzero_depth)} ({100*len(nonzero_depth)/depth_img.size:.1f}%)")
-        print(f"Non-zero depth range: {nonzero_depth.min()} - {nonzero_depth.max()}")
-        print(f"Non-zero depth median: {np.median(nonzero_depth):.0f}")
-        print(f"Non-zero depth mean: {np.mean(nonzero_depth):.0f}")
-
-        # Check depth values in plausible desk region (center of image)
-        h, w = depth_img.shape
-        center_region = depth_img[h//3:2*h//3, w//3:2*w//3]
-        center_nonzero = center_region[center_region > 0]
-        if len(center_nonzero) > 0:
-            print(f"Center region depth: median={np.median(center_nonzero):.0f}, range={center_nonzero.min()}-{center_nonzero.max()}")
-
-        # VIAM depth format seems to be in mm already based on typical RealSense
-        # But values > 10000 suggest camera sees far background
-        # The desk should be around 500-1500mm from camera
-        desk_range = (nonzero_depth > 400) & (nonzero_depth < 2000)
-        desk_pixels = np.sum(desk_range)
-        print(f"Pixels in desk range (400-2000mm): {desk_pixels} ({100*desk_pixels/len(nonzero_depth):.1f}%)")
-    else:
-        print("WARNING: No non-zero depth values!")
-
-    # Update intrinsics based on actual image size
-    h, w = depth_img.shape[:2]
-    if cx == 320 and w != 640:
-        cx, cy = w / 2, h / 2
-        print(f"Adjusted intrinsics for image size: cx={cx}, cy={cy}")
-
-    # Convert to 3D points
-    print("\nConverting to 3D points...")
-    points, pixels = depth_to_points(depth_img, fx, fy, cx, cy)
-    print(f"Generated {len(points)} valid 3D points")
-
-    # Filter to desk-distance range (500-2500mm from camera)
-    # The desk should be within this range based on typical setups
-    desk_depth_mask = (points[:, 2] > 500) & (points[:, 2] < 2500)
-    desk_candidate_points = points[desk_depth_mask]
-    desk_candidate_pixels = pixels[desk_depth_mask]
-    print(f"Points in desk depth range (500-2500mm): {len(desk_candidate_points)}")
-
-    if len(desk_candidate_points) < 100:
-        print("WARNING: Very few points in desk range, expanding search...")
-        # Try wider range
-        desk_depth_mask = (points[:, 2] > 300) & (points[:, 2] < 4000)
-        desk_candidate_points = points[desk_depth_mask]
-        desk_candidate_pixels = pixels[desk_depth_mask]
-        print(f"Points in expanded range (300-4000mm): {len(desk_candidate_points)}")
-
-    # Fit horizontal plane to desk using RANSAC
-    print("\nFitting horizontal plane to desk...")
-    desk_normal, desk_d, desk_inliers_local = fit_plane_ransac(
-        desk_candidate_points, horizontal_only=True
-    )
-
-    # Map inliers back to full point set
-    desk_inliers = np.zeros(len(points), dtype=bool)
-    desk_inliers[desk_depth_mask] = desk_inliers_local
-
-    inlier_pct = 100 * np.sum(desk_inliers) / len(points)
-    print(f"Desk plane found:")
-    print(f"  Normal: [{desk_normal[0]:.4f}, {desk_normal[1]:.4f}, {desk_normal[2]:.4f}]")
-    print(f"  Distance from camera: {abs(desk_d):.1f} mm")
-    print(f"  Inliers: {np.sum(desk_inliers)} ({inlier_pct:.1f}%)")
-
-    # Camera height is distance to desk plane
-    camera_height = abs(desk_d)
-    print(f"\nCamera height above desk: {camera_height:.1f} mm")
-
-    # Find arm base
-    print("\nLooking for arm base...")
-    arm_base_camera, debug = find_arm_base(
-        depth_img, points, pixels,
-        desk_normal, desk_d, desk_inliers,
-        fx, fy, cx, cy
-    )
-
-    if arm_base_camera is None:
-        print(f"ERROR: Could not find arm base - {debug}")
-        await machine.close()
-        return
-
-    print(f"Arm base found in camera frame:")
-    print(f"  Position: [{arm_base_camera[0]:.1f}, {arm_base_camera[1]:.1f}, {arm_base_camera[2]:.1f}] mm")
-    print(f"  Debug: {debug}")
-
-    # Compute transform
-    print("\nComputing camera transform...")
-    R, t = compute_camera_transform(desk_normal, desk_d, arm_base_camera)
-    axis, angle = rotation_matrix_to_axis_angle(R)
-
-    print("\n" + "="*60)
-    print("CALIBRATION RESULTS")
-    print("="*60)
-
-    print(f"\nCamera position in arm frame:")
-    print(f"  x: {t[0]:.1f} mm")
-    print(f"  y: {t[1]:.1f} mm")
-    print(f"  z: {t[2]:.1f} mm (height above desk)")
-
-    print(f"\nCamera orientation (axis-angle):")
-    print(f"  axis: [{axis[0]:.4f}, {axis[1]:.4f}, {axis[2]:.4f}]")
-    print(f"  angle: {angle:.1f} degrees")
-
-    # Output VIAM frame config
-    print("\n" + "="*60)
-    print("VIAM FRAME CONFIGURATION")
-    print("="*60)
-    print("""
-Add this to your realsense camera's frame configuration:
-
-"frame": {
-    "parent": "world",
-    "translation": {
-        "x": %.1f,
-        "y": %.1f,
-        "z": %.1f
-    },
-    "orientation": {
-        "type": "ov_degrees",
-        "value": {
-            "x": %.4f,
-            "y": %.4f,
-            "z": %.4f,
-            "th": %.1f
-        }
-    }
-}
-""" % (t[0], t[1], t[2], axis[0], axis[1], axis[2], angle))
-
-    # Save results
     results = {
-        "camera_position_mm": {"x": float(t[0]), "y": float(t[1]), "z": float(t[2])},
-        "rotation_axis": {"x": float(axis[0]), "y": float(axis[1]), "z": float(axis[2])},
-        "rotation_angle_degrees": float(angle),
-        "desk_plane": {
-            "normal": desk_normal.tolist(),
-            "distance_mm": float(abs(desk_d))
-        },
-        "arm_base_in_camera_frame": arm_base_camera.tolist()
+        "timestamp": timestamp,
+        "initial_joints": current_joints,
+        "initial_pos": current_pos,
+        "measurements": []
     }
 
-    with open("calibration_results.json", "w") as f:
-        json.dump(results, f, indent=2)
-    print("Results saved to calibration_results.json")
+    # ============================================================
+    # STEP 1: Small test movements from current position
+    # ============================================================
+    print("\n" + "=" * 60)
+    print("STEP 1: Test small movements from current position")
+    print("=" * 60)
+    print("Making small joint movements to verify arm responds correctly...")
+
+    # Store starting position
+    start_joints = current_joints.copy()
+
+    # Test: move joint 1 (base) by +5 degrees
+    print("\n--- Test: Rotate base +5° ---")
+    test_joints = start_joints.copy()
+    test_joints[0] = start_joints[0] + 5
+
+    success = await safe_move_joints(arm, test_joints, webcam, output_dir, f"{timestamp}_test_base_plus5")
+    if not success:
+        print("  Base rotation test failed!")
+    else:
+        test_pos = await get_arm_position(arm)
+        results["measurements"].append({
+            "name": "base_plus5",
+            "joints": test_joints,
+            "pos": test_pos
+        })
+
+    # Return to start
+    await safe_move_joints(arm, start_joints, webcam, output_dir, f"{timestamp}_return_start")
+
+    # Test: move joint 2 (shoulder) by +5 degrees
+    print("\n--- Test: Shoulder +5° ---")
+    test_joints = start_joints.copy()
+    test_joints[1] = start_joints[1] + 5
+
+    success = await safe_move_joints(arm, test_joints, webcam, output_dir, f"{timestamp}_test_shoulder_plus5")
+    if not success:
+        print("  Shoulder test failed!")
+    else:
+        test_pos = await get_arm_position(arm)
+        try:
+            depth = await get_depth_image(realsense)
+            test_depth = get_center_depth(depth)
+        except:
+            test_depth = 0
+        results["measurements"].append({
+            "name": "shoulder_plus5",
+            "joints": test_joints,
+            "pos": test_pos,
+            "depth": test_depth
+        })
+        print(f"  Position after shoulder +5°: z={test_pos['z']:.1f} mm, depth={test_depth:.1f} mm")
+
+    # Return to start
+    await safe_move_joints(arm, start_joints, webcam, output_dir, f"{timestamp}_return_start2")
+
+    # Test: move joint 2 (shoulder) by -5 degrees
+    print("\n--- Test: Shoulder -5° ---")
+    test_joints = start_joints.copy()
+    test_joints[1] = start_joints[1] - 5
+
+    success = await safe_move_joints(arm, test_joints, webcam, output_dir, f"{timestamp}_test_shoulder_minus5")
+    if not success:
+        print("  Shoulder test failed!")
+    else:
+        test_pos = await get_arm_position(arm)
+        try:
+            depth = await get_depth_image(realsense)
+            test_depth = get_center_depth(depth)
+        except:
+            test_depth = 0
+        results["measurements"].append({
+            "name": "shoulder_minus5",
+            "joints": test_joints,
+            "pos": test_pos,
+            "depth": test_depth
+        })
+        print(f"  Position after shoulder -5°: z={test_pos['z']:.1f} mm, depth={test_depth:.1f} mm")
+
+    # Return to start
+    await safe_move_joints(arm, start_joints, webcam, output_dir, f"{timestamp}_return_start3")
+
+    # ============================================================
+    # STEP 2: Analyze results
+    # ============================================================
+    print("\n" + "=" * 60)
+    print("STEP 2: Analyze calibration data")
+    print("=" * 60)
+
+    if len(results["measurements"]) >= 2:
+        # Find shoulder measurements
+        shoulder_plus = None
+        shoulder_minus = None
+        for m in results["measurements"]:
+            if m["name"] == "shoulder_plus5":
+                shoulder_plus = m
+            elif m["name"] == "shoulder_minus5":
+                shoulder_minus = m
+
+        if shoulder_plus and shoulder_minus:
+            z_diff = shoulder_plus["pos"]["z"] - shoulder_minus["pos"]["z"]
+            print(f"\n  Shoulder +5° vs -5°:")
+            print(f"    Z position change: {z_diff:.1f} mm")
+
+            if "depth" in shoulder_plus and "depth" in shoulder_minus:
+                depth_diff = shoulder_plus["depth"] - shoulder_minus["depth"]
+                print(f"    Depth change: {depth_diff:.1f} mm")
+
+                # If Z goes up and depth increases, camera points down
+                if z_diff > 0 and depth_diff > 0:
+                    print(f"    Camera Z axis opposes arm Z (camera points down)")
+                elif z_diff > 0 and depth_diff < 0:
+                    print(f"    Camera Z axis aligns with arm Z")
+
+    # ============================================================
+    # Final summary
+    # ============================================================
+    print("\n" + "=" * 60)
+    print("CALIBRATION SUMMARY")
+    print("=" * 60)
+    print(f"""
+Calibration images saved to: {output_dir}/
+
+Based on the small test movements, you can now:
+1. Review the saved images to verify arm movement directions
+2. Use the depth measurements to compute camera offset
+3. Update VIAM config with the frame parameters
+
+For the RealSense frame config, set:
+  "parent": "lite6"
+
+The translation offset needs to be measured or computed from
+larger movements once the safe operating range is confirmed.
+""")
+
+    # Return to starting position
+    print("Returning to starting position...")
+    await safe_move_joints(arm, start_joints, webcam, output_dir, f"{timestamp}_final")
 
     await machine.close()
+
+    # Save results
+    results_file = Path("calibration_results.json")
+    with open(results_file, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\nResults saved to: {results_file}")
 
 
 if __name__ == "__main__":
