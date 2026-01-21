@@ -1,22 +1,26 @@
 import asyncio
+import json
+from pathlib import Path
+
 from viam.robot.client import RobotClient
 from viam.components.arm import Arm
 from viam.components.gripper import Gripper
 from viam.components.camera import Camera
 
 
-# TODO: Fill in your Viam credentials from the CONNECT tab in app.viam.com
-ROBOT_ADDRESS = "<YOUR-ROBOT-ADDRESS>"
-API_KEY = "<YOUR-API-KEY>"
-API_KEY_ID = "<YOUR-API-KEY-ID>"
+def load_credentials():
+    creds_path = Path(__file__).parent / "credentials.json"
+    with open(creds_path) as f:
+        return json.load(f)
 
 
 async def connect():
+    creds = load_credentials()
     opts = RobotClient.Options.with_api_key(
-        api_key=API_KEY,
-        api_key_id=API_KEY_ID
+        api_key=creds["api_key"],
+        api_key_id=creds["api_key_id"]
     )
-    return await RobotClient.at_address(ROBOT_ADDRESS, opts)
+    return await RobotClient.at_address(creds["robot_address"], opts)
 
 
 async def main():
