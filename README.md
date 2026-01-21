@@ -5,7 +5,7 @@ Get a robot arm to pick up and roll dice
 
 1. Install dependencies:
    ```
-   pip install viam-sdk numpy
+   pip install viam-sdk numpy Pillow
    ```
 
 2. Copy the credentials template and fill in your values:
