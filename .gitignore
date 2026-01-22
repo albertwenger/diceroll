@@ -3,3 +3,4 @@ calibration_results.json
 __pycache__/
 *.pyc
 venv/
+calibration_images/

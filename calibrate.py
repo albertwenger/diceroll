@@ -271,118 +271,311 @@ Requirements:
     }
 
     # ============================================================
-    # STEP 1: Small test movements from current position
+    # STEP 1: Move to a pose where camera points at desk
     # ============================================================
     print("\n" + "=" * 60)
-    print("STEP 1: Test small movements from current position")
+    print("STEP 1: Move to desk-viewing pose")
     print("=" * 60)
-    print("Making small joint movements to verify arm responds correctly...")
+    print("Moving arm so RealSense points down at the desk...")
 
-    # Store starting position
-    start_joints = current_joints.copy()
+    # Store original position to return to later
+    original_joints = current_joints.copy()
 
-    # Test: move joint 1 (base) by +5 degrees
-    print("\n--- Test: Rotate base +5° ---")
-    test_joints = start_joints.copy()
-    test_joints[0] = start_joints[0] + 5
+    # Target pose: arm extended forward, wrist pitched down to point camera at desk
+    # Joint angles: [base, shoulder, elbow, wrist_roll, wrist_pitch, ee_roll]
+    # - shoulder ~30° forward
+    # - elbow ~0° (arm extended)
+    # - wrist_pitch ~-90° to point end-effector straight down
+    desk_pose = [0, 30, 0, 0, -90, 0]
 
-    success = await safe_move_joints(arm, test_joints, webcam, output_dir, f"{timestamp}_test_base_plus5")
+    success = await safe_move_joints(arm, desk_pose, webcam, output_dir, f"{timestamp}_desk_pose", max_step=5.0)
     if not success:
-        print("  Base rotation test failed!")
-    else:
-        test_pos = await get_arm_position(arm)
-        results["measurements"].append({
-            "name": "base_plus5",
-            "joints": test_joints,
-            "pos": test_pos
-        })
+        print("  Could not reach desk pose, trying alternative...")
+        # Try a more conservative pose
+        desk_pose = [0, 20, 20, 0, -60, 0]
+        success = await safe_move_joints(arm, desk_pose, webcam, output_dir, f"{timestamp}_desk_pose_alt", max_step=5.0)
 
-    # Return to start
-    await safe_move_joints(arm, start_joints, webcam, output_dir, f"{timestamp}_return_start")
-
-    # Test: move joint 2 (shoulder) by +5 degrees
-    print("\n--- Test: Shoulder +5° ---")
-    test_joints = start_joints.copy()
-    test_joints[1] = start_joints[1] + 5
-
-    success = await safe_move_joints(arm, test_joints, webcam, output_dir, f"{timestamp}_test_shoulder_plus5")
     if not success:
-        print("  Shoulder test failed!")
-    else:
-        test_pos = await get_arm_position(arm)
-        try:
-            depth = await get_depth_image(realsense)
-            test_depth = get_center_depth(depth)
-        except:
-            test_depth = 0
-        results["measurements"].append({
-            "name": "shoulder_plus5",
-            "joints": test_joints,
-            "pos": test_pos,
-            "depth": test_depth
-        })
-        print(f"  Position after shoulder +5°: z={test_pos['z']:.1f} mm, depth={test_depth:.1f} mm")
+        print("  Failed to reach desk-viewing pose. Aborting.")
+        await machine.close()
+        return
 
-    # Return to start
-    await safe_move_joints(arm, start_joints, webcam, output_dir, f"{timestamp}_return_start2")
+    # Check depth at this pose
+    desk_pos = await get_arm_position(arm)
+    try:
+        depth = await get_depth_image(realsense)
+        desk_depth = get_center_depth(depth)
+    except Exception as e:
+        print(f"  Could not get depth: {e}")
+        desk_depth = 0
 
-    # Test: move joint 2 (shoulder) by -5 degrees
-    print("\n--- Test: Shoulder -5° ---")
-    test_joints = start_joints.copy()
-    test_joints[1] = start_joints[1] - 5
+    print(f"\n  Desk pose reached:")
+    print(f"  Position: x={desk_pos['x']:.1f}, y={desk_pos['y']:.1f}, z={desk_pos['z']:.1f} mm")
+    print(f"  Depth to desk: {desk_depth:.1f} mm")
 
-    success = await safe_move_joints(arm, test_joints, webcam, output_dir, f"{timestamp}_test_shoulder_minus5")
-    if not success:
-        print("  Shoulder test failed!")
-    else:
-        test_pos = await get_arm_position(arm)
-        try:
-            depth = await get_depth_image(realsense)
-            test_depth = get_center_depth(depth)
-        except:
-            test_depth = 0
-        results["measurements"].append({
-            "name": "shoulder_minus5",
-            "joints": test_joints,
-            "pos": test_pos,
-            "depth": test_depth
-        })
-        print(f"  Position after shoulder -5°: z={test_pos['z']:.1f} mm, depth={test_depth:.1f} mm")
+    # If depth is unreasonably large, the camera might not be pointing at desk
+    if desk_depth > 2000:
+        print(f"  WARNING: Depth ({desk_depth:.0f}mm) seems too large for desk distance")
+        print(f"  Camera may not be pointing at desk. Trying to adjust wrist pitch...")
 
-    # Return to start
-    await safe_move_joints(arm, start_joints, webcam, output_dir, f"{timestamp}_return_start3")
+        # Try adjusting wrist pitch to point more downward
+        for pitch_adjust in [-10, -20, -30]:
+            adjusted_pose = desk_pose.copy()
+            adjusted_pose[4] = desk_pose[4] + pitch_adjust
+            print(f"\n  Trying wrist pitch = {adjusted_pose[4]}°...")
+
+            success = await safe_move_joints(arm, adjusted_pose, webcam, output_dir,
+                                            f"{timestamp}_pitch_adjust_{pitch_adjust}", max_step=5.0)
+            if success:
+                try:
+                    depth = await get_depth_image(realsense)
+                    new_depth = get_center_depth(depth)
+                    print(f"  Depth at pitch {adjusted_pose[4]}°: {new_depth:.1f} mm")
+                    if new_depth < desk_depth and new_depth > 100:
+                        desk_depth = new_depth
+                        desk_pose = adjusted_pose.copy()
+                        desk_pos = await get_arm_position(arm)
+                        if new_depth < 1500:
+                            print(f"  Found good desk-viewing pose!")
+                            break
+                except:
+                    pass
+
+    # Store the working desk pose
+    start_joints = (await get_current_joints(arm)).copy()
+    print(f"\n  Using pose: [{', '.join(f'{j:.1f}' for j in start_joints)}]")
+    print(f"  End-effector: x={desk_pos['x']:.1f}, y={desk_pos['y']:.1f}, z={desk_pos['z']:.1f} mm")
+    print(f"  Depth to surface: {desk_depth:.1f} mm")
+
+    results["desk_pose"] = {
+        "joints": start_joints,
+        "pos": desk_pos,
+        "depth": desk_depth
+    }
 
     # ============================================================
-    # STEP 2: Analyze results
+    # STEP 2: Calibration movements along Z axis
     # ============================================================
     print("\n" + "=" * 60)
-    print("STEP 2: Analyze calibration data")
+    print("STEP 2: Z-axis calibration (vertical movement)")
     print("=" * 60)
 
-    if len(results["measurements"]) >= 2:
-        # Find shoulder measurements
-        shoulder_plus = None
-        shoulder_minus = None
-        for m in results["measurements"]:
-            if m["name"] == "shoulder_plus5":
-                shoulder_plus = m
-            elif m["name"] == "shoulder_minus5":
-                shoulder_minus = m
+    z_data = []
 
-        if shoulder_plus and shoulder_minus:
-            z_diff = shoulder_plus["pos"]["z"] - shoulder_minus["pos"]["z"]
-            print(f"\n  Shoulder +5° vs -5°:")
-            print(f"    Z position change: {z_diff:.1f} mm")
+    # Move up and down by adjusting shoulder angle
+    for shoulder_delta in [-15, -10, -5, 0, 5, 10, 15]:
+        test_joints = start_joints.copy()
+        test_joints[1] = start_joints[1] + shoulder_delta
 
-            if "depth" in shoulder_plus and "depth" in shoulder_minus:
-                depth_diff = shoulder_plus["depth"] - shoulder_minus["depth"]
-                print(f"    Depth change: {depth_diff:.1f} mm")
+        print(f"\n  Shoulder {shoulder_delta:+d}°...")
+        success = await safe_move_joints(arm, test_joints, webcam, output_dir,
+                                        f"{timestamp}_shoulder_{shoulder_delta:+d}", max_step=5.0)
+        if success:
+            pos = await get_arm_position(arm)
+            try:
+                depth = await get_depth_image(realsense)
+                d = get_center_depth(depth)
+            except:
+                d = 0
 
-                # If Z goes up and depth increases, camera points down
-                if z_diff > 0 and depth_diff > 0:
-                    print(f"    Camera Z axis opposes arm Z (camera points down)")
-                elif z_diff > 0 and depth_diff < 0:
-                    print(f"    Camera Z axis aligns with arm Z")
+            z_data.append({
+                "shoulder_delta": shoulder_delta,
+                "joints": test_joints,
+                "pos": pos,
+                "depth": d
+            })
+            print(f"    Position: z={pos['z']:.1f} mm, Depth: {d:.1f} mm")
+
+    # Return to desk pose
+    await safe_move_joints(arm, start_joints, webcam, output_dir, f"{timestamp}_return_desk")
+
+    results["z_calibration"] = z_data
+
+    # ============================================================
+    # STEP 3: Calibration movements along X axis
+    # ============================================================
+    print("\n" + "=" * 60)
+    print("STEP 3: X-axis calibration (forward/back movement)")
+    print("=" * 60)
+
+    x_data = []
+
+    # Move forward/back by adjusting shoulder and elbow together
+    for delta in [-10, -5, 0, 5, 10]:
+        test_joints = start_joints.copy()
+        # Increase shoulder and decrease elbow to extend forward
+        test_joints[1] = start_joints[1] + delta
+        test_joints[2] = start_joints[2] - delta
+
+        print(f"\n  Forward/back delta {delta:+d}°...")
+        success = await safe_move_joints(arm, test_joints, webcam, output_dir,
+                                        f"{timestamp}_xdelta_{delta:+d}", max_step=5.0)
+        if success:
+            pos = await get_arm_position(arm)
+            try:
+                depth = await get_depth_image(realsense)
+                d = get_center_depth(depth)
+            except:
+                d = 0
+
+            x_data.append({
+                "delta": delta,
+                "joints": test_joints,
+                "pos": pos,
+                "depth": d
+            })
+            print(f"    Position: x={pos['x']:.1f} mm, Depth: {d:.1f} mm")
+
+    # Return to desk pose
+    await safe_move_joints(arm, start_joints, webcam, output_dir, f"{timestamp}_return_desk2")
+
+    results["x_calibration"] = x_data
+
+    # ============================================================
+    # STEP 4: Calibration movements along Y axis
+    # ============================================================
+    print("\n" + "=" * 60)
+    print("STEP 4: Y-axis calibration (left/right movement)")
+    print("=" * 60)
+
+    y_data = []
+
+    # Move left/right by rotating base
+    for base_delta in [-15, -10, -5, 0, 5, 10, 15]:
+        test_joints = start_joints.copy()
+        test_joints[0] = start_joints[0] + base_delta
+
+        print(f"\n  Base rotation {base_delta:+d}°...")
+        success = await safe_move_joints(arm, test_joints, webcam, output_dir,
+                                        f"{timestamp}_base_{base_delta:+d}", max_step=5.0)
+        if success:
+            pos = await get_arm_position(arm)
+            try:
+                depth = await get_depth_image(realsense)
+                d = get_center_depth(depth)
+            except:
+                d = 0
+
+            y_data.append({
+                "base_delta": base_delta,
+                "joints": test_joints,
+                "pos": pos,
+                "depth": d
+            })
+            print(f"    Position: y={pos['y']:.1f} mm, Depth: {d:.1f} mm")
+
+    # Return to desk pose
+    await safe_move_joints(arm, start_joints, webcam, output_dir, f"{timestamp}_return_desk3")
+
+    results["y_calibration"] = y_data
+
+    # ============================================================
+    # STEP 5: Analyze results and compute camera offset
+    # ============================================================
+    print("\n" + "=" * 60)
+    print("STEP 5: Analyze calibration data")
+    print("=" * 60)
+
+    # Analyze Z calibration data
+    if z_data:
+        print("\n  Z-axis analysis:")
+        z_positions = [d["pos"]["z"] for d in z_data if d["depth"] > 0]
+        depths = [d["depth"] for d in z_data if d["depth"] > 0]
+
+        if len(z_positions) >= 2:
+            # Linear regression: depth = slope * z + intercept
+            z_arr = np.array(z_positions)
+            d_arr = np.array(depths)
+            slope, intercept = np.polyfit(z_arr, d_arr, 1)
+
+            print(f"    Depth = {slope:.3f} * arm_z + {intercept:.1f}")
+
+            if slope < -0.5:
+                print(f"    Camera Z opposes arm Z (camera points DOWN)")
+                camera_z_direction = -1
+            elif slope > 0.5:
+                print(f"    Camera Z aligns with arm Z (camera points UP)")
+                camera_z_direction = 1
+            else:
+                print(f"    Camera Z is roughly perpendicular to arm Z")
+                camera_z_direction = 0
+
+            # Estimate desk height in arm frame
+            # When depth = d, camera_z = arm_z + offset_z
+            # desk_z = camera_z - depth (if camera points down)
+            # So: desk_z = arm_z + offset_z - depth
+            # For multiple readings: desk_z should be constant
+            # offset_z = desk_z - arm_z + depth
+
+            # If camera points straight down (slope ≈ -1):
+            # depth ≈ arm_z + offset_z - desk_z
+            # So: intercept ≈ offset_z - desk_z
+
+            results["z_analysis"] = {
+                "slope": slope,
+                "intercept": intercept,
+                "camera_z_direction": camera_z_direction
+            }
+
+    # Analyze Y calibration (base rotation shouldn't change depth much if desk is flat)
+    if y_data:
+        print("\n  Y-axis analysis:")
+        y_positions = [d["pos"]["y"] for d in y_data if d["depth"] > 0]
+        depths = [d["depth"] for d in y_data if d["depth"] > 0]
+
+        if len(depths) >= 2:
+            depth_std = np.std(depths)
+            depth_mean = np.mean(depths)
+            print(f"    Depth mean: {depth_mean:.1f} mm, std: {depth_std:.1f} mm")
+            if depth_std < 50:
+                print(f"    Depth is stable across Y movement (good - flat desk)")
+            else:
+                print(f"    Depth varies with Y (desk may be tilted or camera offset in Y)")
+
+    # Compute camera offset estimate
+    print("\n  Camera offset estimation:")
+
+    if z_data and len([d for d in z_data if d["depth"] > 0]) >= 2:
+        # Use the desk pose as reference
+        ref_pos = results["desk_pose"]["pos"]
+        ref_depth = results["desk_pose"]["depth"]
+
+        if ref_depth > 0 and ref_depth < 2000:
+            # Assuming camera points straight down:
+            # The desk surface is at: desk_z = ref_pos.z - ref_depth + offset_z (in arm frame)
+            # We can estimate offset_z if we know desk_z
+
+            # From multiple Z measurements, find the desk height
+            # depth = arm_z + offset_z - desk_z
+            # So: desk_z = arm_z + offset_z - depth
+            # If slope ≈ -1, then: desk_z ≈ offset_z - intercept
+
+            if abs(slope + 1) < 0.5:  # Camera roughly points down
+                # desk_z ≈ offset_z - intercept
+                # We need another constraint. Use the fact that at ref position:
+                # ref_depth = ref_pos.z + offset_z - desk_z
+                # ref_depth = ref_pos.z + offset_z - (offset_z - intercept)
+                # ref_depth = ref_pos.z + intercept
+                # This is a consistency check
+
+                estimated_desk_z = ref_pos["z"] - ref_depth  # Assuming offset_z ≈ 0 initially
+                print(f"    Estimated desk Z (arm frame): {estimated_desk_z:.1f} mm")
+
+                # The offset_z is the difference between actual and expected
+                # For now, assume small offset and refine with more data
+                offset_z_estimate = 0  # Would need ground truth to compute
+
+                print(f"    Camera offset Z: needs ground truth measurement")
+                print(f"    (Place gripper on desk to measure actual desk_z)")
+
+        results["offset_estimate"] = {
+            "x": 0,  # Would need lateral movement analysis
+            "y": 0,  # Would need lateral movement analysis
+            "z": 0,  # Needs ground truth
+            "notes": "Offset requires ground truth desk height measurement"
+        }
+    else:
+        print("    Insufficient data for offset estimation")
 
     # ============================================================
     # Final summary
@@ -390,24 +583,50 @@ Requirements:
     print("\n" + "=" * 60)
     print("CALIBRATION SUMMARY")
     print("=" * 60)
+
+    print(f"\nCalibration images saved to: {output_dir}/")
+
+    if "z_analysis" in results:
+        slope = results["z_analysis"]["slope"]
+        print(f"\nZ-axis relationship: depth = {slope:.3f} * arm_z + intercept")
+        if slope < -0.5:
+            print("Camera orientation: Points DOWNWARD (Z opposes arm Z)")
+            orientation_config = '''
+     "orientation": {
+       "type": "ov_degrees",
+       "value": {"x": 0, "y": 1, "z": 0, "th": 180}
+     }'''
+        else:
+            print("Camera orientation: Non-standard mounting")
+            orientation_config = "     // Orientation needs manual configuration"
+    else:
+        orientation_config = "     // Orientation could not be determined"
+
     print(f"""
-Calibration images saved to: {output_dir}/
+VIAM Frame Configuration for RealSense:
 
-Based on the small test movements, you can now:
-1. Review the saved images to verify arm movement directions
-2. Use the depth measurements to compute camera offset
-3. Update VIAM config with the frame parameters
+  "frame": {{
+    "parent": "lite6",
+    "translation": {{
+      "x": 0,
+      "y": 0,
+      "z": 0
+    }},{orientation_config}
+  }}
 
-For the RealSense frame config, set:
-  "parent": "lite6"
+NOTE: Translation offset (x, y, z) needs physical measurement
+or ground-truth calibration with a known reference point.
 
-The translation offset needs to be measured or computed from
-larger movements once the safe operating range is confirmed.
+To measure offset:
+1. Move gripper to touch the desk
+2. Record arm Z position (this is desk_z in arm frame)
+3. Move arm up, measure depth to desk
+4. offset_z = depth - (arm_z - desk_z)
 """)
 
-    # Return to starting position
-    print("Returning to starting position...")
-    await safe_move_joints(arm, start_joints, webcam, output_dir, f"{timestamp}_final")
+    # Return to original starting position
+    print("Returning to original position...")
+    await safe_move_joints(arm, original_joints, webcam, output_dir, f"{timestamp}_final", max_step=5.0)
 
     await machine.close()
 
