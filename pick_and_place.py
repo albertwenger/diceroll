@@ -46,8 +46,6 @@ async def move_to_pose_safe(motion: MotionClient, arm: Arm,
     print(f"\nMoving to {description}...")
     print(f"  Target: x={target.x:.1f}, y={target.y:.1f}, z={target.z:.1f}")
 
-    arm_name = arm.get_resource_name()
-
     # Create PoseInFrame for the destination
     destination = PoseInFrame(
         reference_frame="world",
@@ -57,7 +55,7 @@ async def move_to_pose_safe(motion: MotionClient, arm: Arm,
     try:
         # Use motion service for collision-aware planning
         success = await motion.move(
-            component_name=arm_name,
+            component_name=arm.name,
             destination=destination,
             world_state=world_state
         )

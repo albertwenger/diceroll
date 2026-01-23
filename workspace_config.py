@@ -135,10 +135,12 @@ def create_workspace_obstacles() -> GeometriesInFrame:
         600, 800, TABLE["thickness"]
     ))
 
-    # Tray bottom (the green surface)
+    # Tray bottom (the green surface) - positioned below surface to allow picks
+    # This prevents the arm from going through the table while allowing
+    # the gripper to reach cubes on the tray surface
     geometries.append(create_box_geometry(
         "tray_bottom",
-        TRAY["center_x"], TRAY["center_y"], TRAY["surface_z"] - 5,
+        TRAY["center_x"], TRAY["center_y"], TRAY["surface_z"] - 20,
         TRAY["width_x"], TRAY["width_y"], 10
     ))
 
