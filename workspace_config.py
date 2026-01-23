@@ -1,11 +1,15 @@
 """
 Workspace configuration for collision avoidance.
 
-Defines the physical workspace boundaries and obstacles.
+Setup: Green tray with colored cubes (dice) and black bowls
+- Arm is positioned beside the tray
+- Cubes are in the center of the tray on a white square
+- Two black bowls on left and right sides of tray
+
 All measurements in millimeters relative to arm base frame.
 
 Coordinate system:
-  +X: Forward (away from arm base, toward back of desk)
+  +X: Forward (away from arm base, toward the tray)
   +Y: Left (from arm's perspective)
   +Z: Up
 
@@ -19,69 +23,86 @@ from viam.proto.common import (
 
 
 # =============================================================================
-# WORKSPACE DIMENSIONS
+# WORKSPACE DIMENSIONS - GREEN TRAY SETUP
 # =============================================================================
 
-# Desk surface
-DESK = {
-    "center_x": 250,      # Center of desk relative to arm base
-    "center_y": 0,        # Centered left-right
-    "surface_z": -10,     # Desk surface level (slightly below arm base)
-    "width_x": 600,       # Front-to-back dimension
-    "width_y": 800,       # Left-to-right dimension
-    "thickness": 30,      # Desk thickness (for collision box)
+# The green tray/bin that holds the workspace
+# Estimated dimensions from webcam view
+TRAY = {
+    "center_x": 250,      # Center of tray relative to arm base
+    "center_y": 50,       # Slightly to the left (tray is in front-left of arm)
+    "surface_z": 0,       # Tray bottom surface level
+    "width_x": 400,       # Front-to-back dimension (~40cm)
+    "width_y": 600,       # Left-to-right dimension (~60cm)
+    "wall_height": 80,    # Height of tray walls (~8cm)
+    "wall_thickness": 10, # Thickness of tray walls
 }
 
-# Gray divider on the right side
-RIGHT_DIVIDER = {
-    "center_x": 300,      # Roughly centered front-to-back
-    "center_y": -350,     # ~35cm to the right of arm
-    "center_z": 150,      # Mid-height of divider
-    "width_x": 400,       # Front-to-back span
-    "width_y": 30,        # Thickness of divider
-    "height_z": 300,      # Height of divider
+# Table/surface the tray sits on
+TABLE = {
+    "surface_z": -50,     # Table is below the tray
+    "thickness": 30,
 }
 
-# Gray divider at the back
-BACK_DIVIDER = {
-    "center_x": 450,      # ~45cm in front of arm
-    "center_y": 0,        # Centered
-    "center_z": 150,      # Mid-height
-    "width_x": 30,        # Thickness
-    "width_y": 600,       # Left-to-right span
-    "height_z": 300,      # Height
+# =============================================================================
+# OBJECT POSITIONS (approximate, will need vision for precise location)
+# =============================================================================
+
+# Colored cubes (dice) - in center of tray on white square
+# The cubes appear to be ~25-30mm each
+CUBE_SIZE = 25  # mm, approximate cube dimension
+
+# Approximate cube positions (center of tray)
+# From RealSense view: green(top-left), blue(top-right), red(bottom-left), yellow(bottom-right)
+CUBES = {
+    "green": {"x": 230, "y": 70, "z": CUBE_SIZE/2},
+    "blue": {"x": 230, "y": 30, "z": CUBE_SIZE/2},
+    "red": {"x": 270, "y": 70, "z": CUBE_SIZE/2},
+    "yellow": {"x": 270, "y": 30, "z": CUBE_SIZE/2},
 }
 
-# Equipment area behind the arm (RealSense mount, etc.)
-EQUIPMENT_ZONE = {
-    "center_x": -100,     # Behind arm base
-    "center_y": 0,
-    "center_z": 200,
-    "width_x": 150,
-    "width_y": 200,
-    "height_z": 400,
+# Black bowls - on left and right sides of tray
+# Bowls are approximately 100mm diameter, 40mm deep
+BOWL_DIAMETER = 100
+BOWL_DEPTH = 40
+
+BOWLS = {
+    "left": {"x": 250, "y": 200, "z": BOWL_DEPTH/2},   # Left bowl
+    "right": {"x": 250, "y": -100, "z": BOWL_DEPTH/2}, # Right bowl
 }
 
-# Safe working area boundaries
+# =============================================================================
+# SAFE WORKING AREA
+# =============================================================================
+
 WORK_AREA = {
-    "min_x": 50,          # Don't reach behind arm base
-    "max_x": 400,         # Stay away from back divider
-    "min_y": -300,        # Stay away from right divider
-    "max_y": 300,         # Left boundary
-    "min_z": 20,          # Stay above desk surface
-    "max_z": 500,         # Upper limit
+    "min_x": 100,         # Don't reach too close to arm base
+    "max_x": 400,         # Don't go past tray
+    "min_y": -150,        # Right side limit (past right bowl)
+    "max_y": 250,         # Left side limit (past left bowl)
+    "min_z": 10,          # Stay above tray surface
+    "max_z": 400,         # Upper limit
 }
 
-# Key positions
+# =============================================================================
+# KEY POSITIONS
+# =============================================================================
+
 HOME_POSITION = {
     "x": 200,
-    "y": 0,
-    "z": 300,
-    "gripper_down": True,  # Gripper pointing down
+    "y": 50,
+    "z": 250,
+    "gripper_down": True,
 }
 
-# Default approach height for pick/place operations
-APPROACH_HEIGHT = 80  # mm above pick/place point
+# Height above pick point to approach from
+APPROACH_HEIGHT = 60  # mm
+
+# Height to lift object after picking
+LIFT_HEIGHT = 100  # mm
+
+# Height above bowl to release cube (for rolling/dropping)
+DROP_HEIGHT = 80  # mm above bowl rim
 
 
 # =============================================================================
@@ -107,33 +128,53 @@ def create_workspace_obstacles() -> GeometriesInFrame:
     """Create all workspace obstacles for collision avoidance."""
     geometries = []
 
-    # Desk surface
+    # Table surface (below the tray)
     geometries.append(create_box_geometry(
-        "desk_surface",
-        DESK["center_x"], DESK["center_y"], DESK["surface_z"] - DESK["thickness"]/2,
-        DESK["width_x"], DESK["width_y"], DESK["thickness"]
+        "table_surface",
+        TRAY["center_x"], TRAY["center_y"], TABLE["surface_z"] - TABLE["thickness"]/2,
+        600, 800, TABLE["thickness"]
     ))
 
-    # Right divider
+    # Tray bottom (the green surface)
     geometries.append(create_box_geometry(
-        "right_divider",
-        RIGHT_DIVIDER["center_x"], RIGHT_DIVIDER["center_y"], RIGHT_DIVIDER["center_z"],
-        RIGHT_DIVIDER["width_x"], RIGHT_DIVIDER["width_y"], RIGHT_DIVIDER["height_z"]
+        "tray_bottom",
+        TRAY["center_x"], TRAY["center_y"], TRAY["surface_z"] - 5,
+        TRAY["width_x"], TRAY["width_y"], 10
     ))
 
-    # Back divider
+    # Tray walls (4 sides)
+    wall_h = TRAY["wall_height"]
+    wall_t = TRAY["wall_thickness"]
+    cx, cy = TRAY["center_x"], TRAY["center_y"]
+    wx, wy = TRAY["width_x"], TRAY["width_y"]
+
+    # Front wall (closer to arm)
     geometries.append(create_box_geometry(
-        "back_divider",
-        BACK_DIVIDER["center_x"], BACK_DIVIDER["center_y"], BACK_DIVIDER["center_z"],
-        BACK_DIVIDER["width_x"], BACK_DIVIDER["width_y"], BACK_DIVIDER["height_z"]
+        "tray_wall_front",
+        cx - wx/2 + wall_t/2, cy, wall_h/2,
+        wall_t, wy, wall_h
     ))
 
-    # Equipment zone (optional - uncomment if needed)
-    # geometries.append(create_box_geometry(
-    #     "equipment_zone",
-    #     EQUIPMENT_ZONE["center_x"], EQUIPMENT_ZONE["center_y"], EQUIPMENT_ZONE["center_z"],
-    #     EQUIPMENT_ZONE["width_x"], EQUIPMENT_ZONE["width_y"], EQUIPMENT_ZONE["height_z"]
-    # ))
+    # Back wall (far from arm)
+    geometries.append(create_box_geometry(
+        "tray_wall_back",
+        cx + wx/2 - wall_t/2, cy, wall_h/2,
+        wall_t, wy, wall_h
+    ))
+
+    # Left wall
+    geometries.append(create_box_geometry(
+        "tray_wall_left",
+        cx, cy + wy/2 - wall_t/2, wall_h/2,
+        wx, wall_t, wall_h
+    ))
+
+    # Right wall
+    geometries.append(create_box_geometry(
+        "tray_wall_right",
+        cx, cy - wy/2 + wall_t/2, wall_h/2,
+        wx, wall_t, wall_h
+    ))
 
     return GeometriesInFrame(
         reference_frame="world",
@@ -148,11 +189,36 @@ def create_world_state() -> WorldState:
 
 def get_home_pose() -> Pose:
     """Get the home position pose."""
-    # Gripper pointing down: o_z=-1 or use orientation vector
     return Pose(
         x=HOME_POSITION["x"],
         y=HOME_POSITION["y"],
         z=HOME_POSITION["z"],
+        o_x=0, o_y=0, o_z=-1, theta=0  # Gripper pointing down
+    )
+
+
+def get_cube_pose(color: str) -> Pose:
+    """Get the pose for picking up a specific colored cube."""
+    if color not in CUBES:
+        raise ValueError(f"Unknown cube color: {color}. Available: {list(CUBES.keys())}")
+    cube = CUBES[color]
+    return Pose(
+        x=cube["x"],
+        y=cube["y"],
+        z=cube["z"] + 5,  # Slightly above center for grip
+        o_x=0, o_y=0, o_z=-1, theta=0
+    )
+
+
+def get_bowl_pose(side: str) -> Pose:
+    """Get the pose for placing into a bowl."""
+    if side not in BOWLS:
+        raise ValueError(f"Unknown bowl: {side}. Available: {list(BOWLS.keys())}")
+    bowl = BOWLS[side]
+    return Pose(
+        x=bowl["x"],
+        y=bowl["y"],
+        z=bowl["z"] + DROP_HEIGHT,  # Above the bowl to drop
         o_x=0, o_y=0, o_z=-1, theta=0
     )
 
@@ -168,10 +234,11 @@ def is_pose_in_work_area(pose: Pose) -> bool:
 
 def print_workspace_info():
     """Print workspace configuration summary."""
-    print("Workspace Configuration:")
-    print(f"  Desk: {DESK['width_x']}x{DESK['width_y']}mm at z={DESK['surface_z']}mm")
-    print(f"  Right divider: y={RIGHT_DIVIDER['center_y']}mm")
-    print(f"  Back divider: x={BACK_DIVIDER['center_x']}mm")
+    print("Workspace Configuration (Green Tray Setup):")
+    print(f"  Tray: {TRAY['width_x']}x{TRAY['width_y']}mm at center ({TRAY['center_x']}, {TRAY['center_y']})")
+    print(f"  Tray walls: {TRAY['wall_height']}mm high")
+    print(f"  Cubes: {list(CUBES.keys())}")
+    print(f"  Bowls: {list(BOWLS.keys())}")
     print(f"  Work area: x=[{WORK_AREA['min_x']}, {WORK_AREA['max_x']}], "
           f"y=[{WORK_AREA['min_y']}, {WORK_AREA['max_y']}], "
           f"z=[{WORK_AREA['min_z']}, {WORK_AREA['max_z']}]")
@@ -179,7 +246,13 @@ def print_workspace_info():
 
 if __name__ == "__main__":
     print_workspace_info()
+    print("\nCube positions:")
+    for color, pos in CUBES.items():
+        print(f"  {color}: ({pos['x']}, {pos['y']}, {pos['z']})")
+    print("\nBowl positions:")
+    for side, pos in BOWLS.items():
+        print(f"  {side}: ({pos['x']}, {pos['y']}, {pos['z']})")
     print("\nObstacles created:")
     obstacles = create_workspace_obstacles()
     for geom in obstacles.geometries:
-        print(f"  - {geom.label}: center=({geom.center.x}, {geom.center.y}, {geom.center.z})")
+        print(f"  - {geom.label}")

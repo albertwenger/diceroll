@@ -12,14 +12,13 @@ from pathlib import Path
 from viam.robot.client import RobotClient
 from viam.components.arm import Arm
 from viam.components.gripper import Gripper
-from viam.components.camera import Camera
 from viam.services.motion import MotionClient
-from viam.services.vision import VisionClient
-from viam.proto.common import Pose, PoseInFrame, ResourceName
+from viam.proto.common import Pose, PoseInFrame
 
 from workspace_config import (
     create_world_state, get_home_pose, is_pose_in_work_area,
-    print_workspace_info, APPROACH_HEIGHT
+    print_workspace_info, APPROACH_HEIGHT,
+    get_cube_pose, get_bowl_pose, CUBES, BOWLS
 )
 
 
@@ -36,11 +35,6 @@ async def connect():
         api_key_id=creds["api_key_id"]
     )
     return await RobotClient.at_address(creds["robot_address"], opts)
-
-
-async def get_arm_resource_name(arm: Arm) -> ResourceName:
-    """Get the ResourceName for the arm component."""
-    return arm.get_resource_name()
 
 
 async def move_to_pose_safe(motion: MotionClient, arm: Arm,
@@ -197,7 +191,51 @@ async def move_to_home(motion: MotionClient, arm: Arm, world_state):
                                     world_state, "home position")
 
 
+async def roll_cube(machine, motion, arm, gripper, world_state,
+                    cube_color: str, bowl_side: str):
+    """
+    Pick up a colored cube and roll it into a bowl.
+
+    Args:
+        cube_color: "green", "blue", "red", or "yellow"
+        bowl_side: "left" or "right"
+    """
+    print(f"\n{'=' * 60}")
+    print(f"ROLLING {cube_color.upper()} CUBE INTO {bowl_side.upper()} BOWL")
+    print("=" * 60)
+
+    # Get poses from workspace config
+    pick_pose = get_cube_pose(cube_color)
+    place_pose = get_bowl_pose(bowl_side)
+
+    print(f"\nPick pose ({cube_color} cube):")
+    print(f"  x={pick_pose.x:.1f}, y={pick_pose.y:.1f}, z={pick_pose.z:.1f}")
+    print(f"\nPlace pose ({bowl_side} bowl):")
+    print(f"  x={place_pose.x:.1f}, y={place_pose.y:.1f}, z={place_pose.z:.1f}")
+
+    # Pick up the cube
+    success = await pick_object(motion, arm, gripper, pick_pose, world_state)
+
+    if success:
+        # Drop into bowl
+        await place_object(motion, arm, gripper, place_pose, world_state)
+    else:
+        print(f"\nFailed to pick up {cube_color} cube")
+
+    return success
+
+
 async def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Pick and place dice")
+    parser.add_argument("--cube", "-c", choices=list(CUBES.keys()),
+                        default="green", help="Cube color to pick")
+    parser.add_argument("--bowl", "-b", choices=list(BOWLS.keys()),
+                        default="right", help="Bowl to drop into")
+    parser.add_argument("--all", "-a", action="store_true",
+                        help="Roll all cubes (alternating bowls)")
+    args = parser.parse_args()
+
     print("=" * 60)
     print("DICE PICK AND PLACE")
     print("=" * 60)
@@ -223,53 +261,38 @@ async def main():
     print(f"\nCurrent arm position:")
     print(f"  x={current_pos.x:.1f}, y={current_pos.y:.1f}, z={current_pos.z:.1f}")
 
-    # ===========================================
-    # DEMO: Pick and Place sequence
-    # ===========================================
-
-    # Define pick location (where dice is)
-    # TODO: Replace with vision-based detection
-    pick_pose = Pose(
-        x=250,      # 25cm in front of arm
-        y=50,       # 5cm to the left
-        z=50,       # 5cm above desk (accounting for dice height)
-        o_x=0, o_y=0, o_z=-1, theta=0  # Gripper pointing down
-    )
-
-    # Define place/roll location
-    place_pose = Pose(
-        x=300,      # 30cm in front
-        y=-50,      # 5cm to the right
-        z=100,      # 10cm above desk (will drop/roll)
-        o_x=0, o_y=0, o_z=-1, theta=0
-    )
-
-    # Move to home first
-    print("\n" + "=" * 60)
-    print("STEP 1: Move to home position")
-    print("=" * 60)
-    await move_to_home(motion, arm, world_state)
-
-    # Pick up dice
-    print("\n" + "=" * 60)
-    print("STEP 2: Pick up dice")
-    print("=" * 60)
-    success = await pick_object(motion, arm, gripper, pick_pose, world_state)
-
-    if success:
-        # Place/roll dice
+    try:
+        # Move to home first
         print("\n" + "=" * 60)
-        print("STEP 3: Roll dice")
+        print("STEP 1: Move to home position")
         print("=" * 60)
-        await place_object(motion, arm, gripper, place_pose, world_state)
+        await move_to_home(motion, arm, world_state)
 
-    # Return home
-    print("\n" + "=" * 60)
-    print("STEP 4: Return to home")
-    print("=" * 60)
-    await move_to_home(motion, arm, world_state)
+        if args.all:
+            # Roll all cubes, alternating between bowls
+            bowls = ["left", "right"]
+            for i, cube_color in enumerate(CUBES.keys()):
+                bowl_side = bowls[i % 2]
+                await roll_cube(machine, motion, arm, gripper, world_state,
+                               cube_color, bowl_side)
+                # Return to home between picks
+                await move_to_home(motion, arm, world_state)
+        else:
+            # Roll a single cube
+            await roll_cube(machine, motion, arm, gripper, world_state,
+                           args.cube, args.bowl)
 
-    await machine.close()
+        # Return home
+        print("\n" + "=" * 60)
+        print("FINAL: Return to home")
+        print("=" * 60)
+        await move_to_home(motion, arm, world_state)
+
+    except KeyboardInterrupt:
+        print("\n\nStopped by user")
+    finally:
+        await machine.close()
+
     print("\nDone!")
 
 
