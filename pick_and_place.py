@@ -17,8 +17,11 @@ from viam.proto.common import Pose, PoseInFrame
 
 from workspace_config import (
     create_world_state, get_home_pose, is_pose_in_work_area,
-    print_workspace_info, APPROACH_HEIGHT,
-    get_cube_pose, get_bowl_pose, CUBES, BOWLS
+    print_workspace_info, APPROACH_HEIGHT, BOWLS
+)
+from vision_detect import (
+    move_to_scan_position, find_cube_position, get_bowl_pose,
+    CUBE_DETECTORS
 )
 
 
@@ -192,7 +195,7 @@ async def move_to_home(motion: MotionClient, arm: Arm, world_state):
 async def roll_cube(machine, motion, arm, gripper, world_state,
                     cube_color: str, bowl_side: str):
     """
-    Pick up a colored cube and roll it into a bowl.
+    Pick up a colored cube and roll it into a bowl using vision detection.
 
     Args:
         cube_color: "green", "blue", "red", or "yellow"
@@ -202,12 +205,23 @@ async def roll_cube(machine, motion, arm, gripper, world_state,
     print(f"ROLLING {cube_color.upper()} CUBE INTO {bowl_side.upper()} BOWL")
     print("=" * 60)
 
-    # Get poses from workspace config
-    pick_pose = get_cube_pose(cube_color)
-    place_pose = get_bowl_pose(bowl_side)
+    # Move to scanning position to see the workspace
+    await move_to_scan_position(machine)
+    await asyncio.sleep(0.5)  # Let camera stabilize
 
-    print(f"\nPick pose ({cube_color} cube):")
+    # Use vision to find the cube
+    print(f"\nLooking for {cube_color} cube...")
+    pick_pose = await find_cube_position(machine, cube_color)
+
+    if pick_pose is None:
+        print(f"  Could not find {cube_color} cube!")
+        return False
+
+    print(f"\nDetected {cube_color} cube at:")
     print(f"  x={pick_pose.x:.1f}, y={pick_pose.y:.1f}, z={pick_pose.z:.1f}")
+
+    # Get bowl position (hardcoded since bowls don't move)
+    place_pose = get_bowl_pose(bowl_side)
     print(f"\nPlace pose ({bowl_side} bowl):")
     print(f"  x={place_pose.x:.1f}, y={place_pose.y:.1f}, z={place_pose.z:.1f}")
 
@@ -226,8 +240,8 @@ async def roll_cube(machine, motion, arm, gripper, world_state,
 async def main():
     import argparse
     parser = argparse.ArgumentParser(description="Pick and place dice")
-    parser.add_argument("--cube", "-c", choices=list(CUBES.keys()),
-                        default="green", help="Cube color to pick")
+    parser.add_argument("--cube", "-c", choices=list(CUBE_DETECTORS.keys()),
+                        default="yellow", help="Cube color to pick")
     parser.add_argument("--bowl", "-b", choices=list(BOWLS.keys()),
                         default="right", help="Bowl to drop into")
     parser.add_argument("--all", "-a", action="store_true",
@@ -269,7 +283,7 @@ async def main():
         if args.all:
             # Roll all cubes, alternating between bowls
             bowls = ["left", "right"]
-            for i, cube_color in enumerate(CUBES.keys()):
+            for i, cube_color in enumerate(CUBE_DETECTORS.keys()):
                 bowl_side = bowls[i % 2]
                 await roll_cube(machine, motion, arm, gripper, world_state,
                                cube_color, bowl_side)
