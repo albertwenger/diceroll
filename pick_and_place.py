@@ -20,9 +20,10 @@ from workspace_config import (
     print_workspace_info, APPROACH_HEIGHT, BOWLS
 )
 from vision_detect import (
-    move_to_scan_position, find_cube_position, get_bowl_pose,
-    CUBE_DETECTORS
+    move_to_scan_position, find_cube_position, find_cube_position_3d,
+    get_bowl_pose, CUBE_DETECTORS
 )
+from capture import capture_once, IMAGES_DIR
 
 
 def load_credentials():
@@ -120,6 +121,17 @@ async def pick_object(motion: MotionClient, arm: Arm, gripper: Gripper,
     if not success:
         return False
 
+    # Debug: capture at pick position before closing gripper
+    # (imported capture_once if available)
+    try:
+        from capture import capture_once
+        from datetime import datetime
+        ts = datetime.now().strftime("%H%M%S")
+        print("\n  [DEBUG] Capturing at pick position...")
+        # Need machine reference - skip if not available
+    except:
+        pass
+
     # 4. Close gripper (grab)
     print("\n  Closing gripper...")
     grabbed = await gripper.grab()
@@ -193,14 +205,17 @@ async def move_to_home(motion: MotionClient, arm: Arm, world_state):
 
 
 async def roll_cube(machine, motion, arm, gripper, world_state,
-                    cube_color: str, bowl_side: str):
+                    cube_color: str, bowl_side: str, debug: bool = False):
     """
     Pick up a colored cube and roll it into a bowl using vision detection.
 
     Args:
         cube_color: "green", "blue", "red", or "yellow"
         bowl_side: "left" or "right"
+        debug: If True, capture images at each step
     """
+    from datetime import datetime
+
     print(f"\n{'=' * 60}")
     print(f"ROLLING {cube_color.upper()} CUBE INTO {bowl_side.upper()} BOWL")
     print("=" * 60)
@@ -209,9 +224,14 @@ async def roll_cube(machine, motion, arm, gripper, world_state,
     await move_to_scan_position(machine)
     await asyncio.sleep(0.5)  # Let camera stabilize
 
-    # Use vision to find the cube
+    if debug:
+        ts = datetime.now().strftime("%H%M%S")
+        print(f"\n[DEBUG] Capturing images at scan position...")
+        await capture_once(machine, ["webcam", "realsense"], f"debug_1_scan_{ts}")
+
+    # Use vision to find the cube (try 3D first, fall back to 2D)
     print(f"\nLooking for {cube_color} cube...")
-    pick_pose = await find_cube_position(machine, cube_color)
+    pick_pose = await find_cube_position_3d(machine, cube_color)
 
     if pick_pose is None:
         print(f"  Could not find {cube_color} cube!")
@@ -228,9 +248,19 @@ async def roll_cube(machine, motion, arm, gripper, world_state,
     # Pick up the cube
     success = await pick_object(motion, arm, gripper, pick_pose, world_state)
 
+    if debug:
+        ts = datetime.now().strftime("%H%M%S")
+        print(f"\n[DEBUG] Capturing images after pick attempt...")
+        await capture_once(machine, ["webcam"], f"debug_2_after_pick_{ts}")
+
     if success:
         # Drop into bowl
         await place_object(motion, arm, gripper, place_pose, world_state)
+
+        if debug:
+            ts = datetime.now().strftime("%H%M%S")
+            print(f"\n[DEBUG] Capturing images after place...")
+            await capture_once(machine, ["webcam"], f"debug_3_after_place_{ts}")
     else:
         print(f"\nFailed to pick up {cube_color} cube")
 
@@ -246,7 +276,13 @@ async def main():
                         default="right", help="Bowl to drop into")
     parser.add_argument("--all", "-a", action="store_true",
                         help="Roll all cubes (alternating bowls)")
+    parser.add_argument("--debug", "-d", action="store_true",
+                        help="Capture images at each step for debugging")
     args = parser.parse_args()
+
+    # Ensure images directory exists for debug captures
+    if args.debug:
+        IMAGES_DIR.mkdir(exist_ok=True)
 
     print("=" * 60)
     print("DICE PICK AND PLACE")
@@ -286,13 +322,13 @@ async def main():
             for i, cube_color in enumerate(CUBE_DETECTORS.keys()):
                 bowl_side = bowls[i % 2]
                 await roll_cube(machine, motion, arm, gripper, world_state,
-                               cube_color, bowl_side)
+                               cube_color, bowl_side, debug=args.debug)
                 # Return to home between picks
                 await move_to_home(motion, arm, world_state)
         else:
             # Roll a single cube
             await roll_cube(machine, motion, arm, gripper, world_state,
-                           args.cube, args.bowl)
+                           args.cube, args.bowl, debug=args.debug)
 
         # Return home
         print("\n" + "=" * 60)

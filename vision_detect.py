@@ -38,8 +38,8 @@ BOWL_POSITIONS = {
 
 # Scanning position - arm looks down at the center of the tray
 SCAN_POSITION = {
-    "x": 250,
-    "y": 0,
+    "x": 300,  # Forward enough to see all cubes
+    "y": 50,   # Centered over tray (tray center is at y=50)
     "z": 350,  # High enough to see the whole workspace
 }
 
@@ -47,10 +47,10 @@ SCAN_POSITION = {
 # These convert pixel coordinates to 3D coordinates
 # Higher focal length = smaller world offset for same pixel offset
 CAMERA_INTRINSICS = {
-    "fx": 900.0,  # Focal length x (increased to reduce offset)
-    "fy": 900.0,  # Focal length y (increased to reduce offset)
-    "cx": 320.0,  # Principal point x
-    "cy": 240.0,  # Principal point y
+    "fx": 909.15,  # Focal length x (from camera intrinsics)
+    "fy": 909.15,  # Focal length y (from camera intrinsics)
+    "cx": 649.0,   # Principal point x (from camera intrinsics)
+    "cy": 380.2,   # Principal point y (from camera intrinsics)
 }
 
 
@@ -293,7 +293,7 @@ async def pixel_to_world(
         # Camera X = right (arm -Y), Camera Y = down in image (arm +X), Camera Z = forward (arm -Z)
         world_x = arm_pos.x + cam_y  # Camera Y (down in img) -> arm forward
         world_y = arm_pos.y - cam_x  # Camera X (right) -> arm left
-        world_z = 15  # Cube pick height above tray surface
+        world_z = 8  # Lower to ensure gripper gets around cube (cube is ~25mm tall)
 
         print(f"  Distance: {distance_to_surface:.0f}mm, Offset: ({cam_x:.1f}, {cam_y:.1f})")
 
@@ -306,13 +306,128 @@ async def pixel_to_world(
         return None
 
 
+async def find_cube_position_3d(
+    machine,
+    color: str,
+    camera_name: str = "realsense",
+    segmenter_name: str = "vision-pointcloud"
+) -> Optional[Pose]:
+    """
+    Find a colored cube using 3D segmentation for accurate world position.
+
+    Uses VIAM's obstacles_pointcloud segmenter to get 3D object positions directly,
+    combined with color detection to identify the specific cube.
+
+    Args:
+        machine: Connected robot client
+        color: Cube color ("green", "blue", "red", "yellow")
+        camera_name: Camera to use
+        segmenter_name: Name of the 3D segmenter vision service
+
+    Returns:
+        Pose of the cube in world frame, or None if not found
+    """
+    if color not in CUBE_DETECTORS:
+        print(f"  Unknown color: {color}")
+        return None
+
+    try:
+        # Get 3D objects from segmenter (with retry)
+        segmenter = VisionClient.from_robot(machine, segmenter_name)
+
+        # Try up to 3 times with delay
+        objects = None
+        for attempt in range(3):
+            await asyncio.sleep(0.5)  # Let camera stabilize
+            objects = await segmenter.get_object_point_clouds(camera_name)
+            if objects:
+                break
+            print(f"  Segmenter attempt {attempt+1}: no objects, retrying...")
+
+        if not objects:
+            print(f"  No 3D objects detected by segmenter")
+            # Fall back to 2D detection
+            return await find_cube_position(machine, color, camera_name)
+
+        print(f"  Segmenter found {len(objects)} 3D object(s)")
+
+        # Also get color detections to match
+        detector_name = CUBE_DETECTORS[color]
+        detections = await detect_cubes_with_service(machine, detector_name, camera_name)
+
+        if not detections:
+            print(f"  No {color} color detected")
+            return None
+
+        # Find the 3D object closest to the color detection
+        best_detection = max(detections, key=lambda d: d.confidence)
+        print(f"  {color} detected at pixel ({best_detection.x_px}, {best_detection.y_px})")
+
+        # Get arm position for coordinate transform
+        arm = Arm.from_robot(machine, "lite6")
+        arm_pos = await arm.get_end_position()
+
+        # Filter objects that might be cubes on the tray
+        # Segmenter returns camera-frame coords: z=depth, x=horizontal, y=vertical (negative=down)
+        # Cubes should be at depth ~300-400mm from camera (camera at z=350, tray at z≈0)
+        # and have small x/y offsets (within tray bounds)
+        candidate_cubes = []
+        for obj in objects:
+            if obj.geometries and len(obj.geometries.geometries) > 0:
+                geom = obj.geometries.geometries[0]
+                c = geom.center  # Camera frame coordinates
+
+                # Filter: depth 200-450mm, x within ±200mm, y negative (below camera)
+                if 200 < c.z < 450 and -200 < c.x < 200 and -200 < c.y < 0:
+                    # Transform camera coords to world coords
+                    # Camera Z (depth) -> World -Z direction (camera looks down)
+                    # Camera X (right) -> World -Y (robot's right is negative Y)
+                    # Camera Y (down) -> World +X (forward)
+                    world_x = arm_pos.x - c.y  # Camera down = robot forward
+                    world_y = arm_pos.y - c.x  # Camera right = robot right
+                    world_z = 8  # Pick height for cube
+
+                    candidate_cubes.append({
+                        'cam': (c.x, c.y, c.z),
+                        'world': (world_x, world_y, world_z),
+                        'depth': c.z
+                    })
+
+        print(f"  Found {len(candidate_cubes)} candidate cube(s)")
+
+        if candidate_cubes:
+            # Sort by depth (closest first) and pick the one most likely to be our cube
+            candidate_cubes.sort(key=lambda c: c['depth'])
+
+            for i, cube in enumerate(candidate_cubes[:5]):  # Show top 5
+                print(f"    Candidate {i}: cam=({cube['cam'][0]:.0f},{cube['cam'][1]:.0f},{cube['cam'][2]:.0f}) -> "
+                      f"world=({cube['world'][0]:.0f},{cube['world'][1]:.0f},{cube['world'][2]:.0f})")
+
+            # Use the closest one for now
+            best = candidate_cubes[0]
+            print(f"  Using 3D position for {color} cube")
+            return Pose(
+                x=best['world'][0],
+                y=best['world'][1],
+                z=best['world'][2],
+                o_x=0, o_y=0, o_z=-1, theta=0
+            )
+
+        print(f"  No matching 3D object found, falling back to 2D")
+        return await find_cube_position(machine, color, camera_name)
+
+    except Exception as e:
+        print(f"  3D segmentation error: {e}, falling back to 2D")
+        return await find_cube_position(machine, color, camera_name)
+
+
 async def find_cube_position(
     machine,
     color: str,
     camera_name: str = "realsense"
 ) -> Optional[Pose]:
     """
-    Find a specific colored cube and return its world position.
+    Find a specific colored cube and return its world position (2D fallback method).
 
     Args:
         machine: Connected robot client
@@ -350,7 +465,7 @@ async def find_cube_position(
     return Pose(
         x=world_x,
         y=world_y,
-        z=world_z + 15,  # Slightly above surface for grip
+        z=world_z,  # At cube center height for grip
         o_x=0, o_y=0, o_z=-1, theta=0
     )
 
